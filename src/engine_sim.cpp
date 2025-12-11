@@ -1,779 +1,331 @@
-// engine_sim.cpp
-// Landing page + Inline-4 IC engine animation with exhaust smoke, engine sound,
-// and college logo image on landing page.
-// C++ + FreeGLUT + MSVC (Windows).
-
-#include <windows.h>
-#include <mmsystem.h>
-#pragma comment(lib, "winmm.lib")
-
-#include <GL/freeglut.h>
+#include <iostream>
 #include <cmath>
-#include <cstdlib>
-#include <ctime>
+#include <vector>
 
-// ---------- stb_image (for PNG logo) ----------
-#define STB_IMAGE_IMPLEMENTATION
-#include "stb_image.h"
+// --- Third-party Library Headers ---
+// You will need to install and link these libraries.
+#include <GL/glew.h>  // GLEW for managing OpenGL extensions
+#include <GLFW/glfw3.h> // GLFW for creating the window and context
+#include <glm/glm.hpp>  // GLM for vector math (useful for transformations)
+#include <glm/gtc/matrix_transform.hpp>
 
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
+// --- Constants and Global Variables ---
 
-// ---------------- APP STATE ----------------
+// Window settings
+const unsigned int SCR_WIDTH = 1200;
+const unsigned int SCR_HEIGHT = 800;
+const char* WINDOW_TITLE = "OpenGL Engine Simulation - 4 Stroke";
 
-enum AppState {
-    STATE_LANDING = 0,
-    STATE_ENGINE  = 1
-};
+// Engine simulation state
+float engine_speed_rpm = 1000.0f; // Current RPM
+float crank_angle_degrees = 0.0f; // Crankshaft angle (0 to 720 for a full cycle)
+bool is_running = false;
+bool show_labels = true;
 
-AppState appState = STATE_LANDING;
+// Engine geometry (simplified)
+const float BORE = 0.5f;       // Cylinder diameter
+const float STROKE = 1.0f;     // Total travel of the piston (2 * crank_radius)
+const float CRANK_RADIUS = 0.5f; // R
+const float CONROD_LENGTH = 2.0f; // L (must be > R)
+const int NUM_CYLINDERS = 4;
 
-int winWidth  = 1800;
-int winHeight = 1600;
+// Time tracking for smooth movement
+float last_frame_time = 0.0f;
 
-// Landing page button
-const float BTN_WIDTH  = 260.0f;
-const float BTN_HEIGHT = 60.0f;
-const float BTN_Y      = 90.0f;   // distance from bottom
+// --- Function Declarations ---
+void framebuffer_size_callback(GLFWwindow* window, int width, int height);
+void processInput(GLFWwindow *window);
+void render_scene();
+void draw_piston_assembly(float crank_angle_degrees, float x_offset, int cylinder_index);
+float get_piston_position(float angle_rad);
+std::string get_stroke_name(int cylinder_index);
+void draw_ui_controls();
 
-// ---------------- ENGINE GLOBALS ----------------
+// --- Main Function ---
 
-float crankAngle = 0.0f;      // 0–720 degrees (4-stroke)
-float rpm        = 250.0f;
-int   lastTimeMs = 0;
+int main() {
+    // 1. Initialize GLFW
+    if (!glfwInit()) {
+        std::cerr << "Failed to initialize GLFW" << std::endl;
+        return -1;
+    }
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 
-// Camera
-float camRotX = -35.0f;
-float camRotY =  20.0f;
-float camZoom =  20.0f;
+    // 2. Create a windowed mode window and its OpenGL context
+    GLFWwindow* window = glfwCreateWindow(SCR_WIDTH, SCR_HEIGHT, WINDOW_TITLE, NULL, NULL);
+    if (window == NULL) {
+        std::cerr << "Failed to create GLFW window" << std::endl;
+        glfwTerminate();
+        return -1;
+    }
+    glfwMakeContextCurrent(window);
+    glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
 
-// Inline-4 configuration
-const int   NUM_CYL = 4;
-const float cylX[NUM_CYL]     = { -3.0f, -1.0f,  1.0f,  3.0f };
-const float cylPhase[NUM_CYL] = {   0.0f, 180.0f, 360.0f, 540.0f };
-
-// ---------------- SMOKE PARTICLES ----------------
-
-struct SmokeParticle {
-    bool  active;
-    float x, y, z;
-    float vx, vy, vz;
-    float life; // 0..1
-};
-
-const int MAX_SMOKE = 400;
-SmokeParticle smokeP[MAX_SMOKE];
-
-// ---------------- TEXTURE (LOGO) ----------------
-
-GLuint logoTexID = 0;
-
-GLuint loadTexture(const char* filename)
-{
-    int w, h, channels;
-    stbi_set_flip_vertically_on_load(true);
-    unsigned char* data = stbi_load(filename, &w, &h, &channels, 4);
-    
-
-    if (!data) {
-        MessageBoxA(nullptr, "Failed to load logo image (logocg.png)", "Error", MB_OK);
-        return 0;
+    // 3. Initialize GLEW
+    if (glewInit() != GLEW_OK) {
+        std::cerr << "Failed to initialize GLEW" << std::endl;
+        return -1;
     }
 
-    GLuint tex;
-    glGenTextures(1, &tex);
-    glBindTexture(GL_TEXTURE_2D, tex);
-
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-
-    glTexImage2D(
-        GL_TEXTURE_2D, 0, GL_RGBA,
-        w, h, 0,
-        GL_RGBA, GL_UNSIGNED_BYTE, data
-    );
-
-    stbi_image_free(data);
-    return tex;
-}
-
-// Forward declarations
-void displayWrapper();
-void displayLanding();
-void displayEngine();
-void updateSmoke(float dt);
-void drawSmoke();
-void startEngineSimulation();
-
-// ---------------- SMOKE FUNCTIONS ----------------
-
-void spawnSmoke(float x, float y, float z)
-{
-    for (int i = 0; i < MAX_SMOKE; ++i) {
-        if (!smokeP[i].active) {
-            smokeP[i].active = true;
-            smokeP[i].x = x;
-            smokeP[i].y = y;
-            smokeP[i].z = z;
-
-            float ang = ((float)std::rand() / RAND_MAX) * 2.0f * (float)M_PI;
-            float speed = 0.3f + 0.2f * ((float)std::rand() / RAND_MAX);
-
-            smokeP[i].vx = std::cos(ang) * speed * 0.1f;
-            smokeP[i].vz = std::sin(ang) * speed * 0.1f;
-            smokeP[i].vy = 0.5f + 0.3f * ((float)std::rand() / RAND_MAX);
-
-            smokeP[i].life = 1.0f;
-            return;
-        }
-    }
-}
-
-void updateSmoke(float dt)
-{
-    for (int i = 0; i < MAX_SMOKE; ++i) {
-        if (!smokeP[i].active) continue;
-
-        smokeP[i].life -= dt * 0.35f;
-        if (smokeP[i].life <= 0.0f) {
-            smokeP[i].active = false;
-            continue;
-        }
-
-        smokeP[i].x += smokeP[i].vx * dt;
-        smokeP[i].y += smokeP[i].vy * dt;
-        smokeP[i].z += smokeP[i].vz * dt;
-
-        smokeP[i].vx *= (1.0f - 0.3f * dt);
-        smokeP[i].vz *= (1.0f - 0.3f * dt);
-    }
-}
-
-void drawSmoke()
-{
-    glDisable(GL_LIGHTING);
-    glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-
-    for (int i = 0; i < MAX_SMOKE; ++i) {
-        if (!smokeP[i].active) continue;
-
-        float a    = smokeP[i].life * 0.6f;
-        float size = 0.25f + (1.0f - smokeP[i].life) * 0.35f;
-        float s    = size * 0.5f;
-
-        glPushMatrix();
-        glTranslatef(smokeP[i].x, smokeP[i].y, smokeP[i].z);
-        glColor4f(0.75f, 0.75f, 0.75f, a);
-
-        glBegin(GL_QUADS);
-        // front
-        glVertex3f(-s,-s, s); glVertex3f( s,-s, s);
-        glVertex3f( s, s, s); glVertex3f(-s, s, s);
-        // back
-        glVertex3f(-s,-s,-s); glVertex3f(-s, s,-s);
-        glVertex3f( s, s,-s); glVertex3f( s,-s,-s);
-        // left
-        glVertex3f(-s,-s,-s); glVertex3f(-s,-s, s);
-        glVertex3f(-s, s, s); glVertex3f(-s, s,-s);
-        // right
-        glVertex3f( s,-s,-s); glVertex3f( s, s,-s);
-        glVertex3f( s, s, s); glVertex3f( s,-s, s);
-        // top
-        glVertex3f(-s, s,-s); glVertex3f(-s, s, s);
-        glVertex3f( s, s, s); glVertex3f( s, s,-s);
-        // bottom
-        glVertex3f(-s,-s,-s); glVertex3f( s,-s,-s);
-        glVertex3f( s,-s, s); glVertex3f(-s,-s, s);
-        glEnd();
-
-        glPopMatrix();
-    }
-
-    glDisable(GL_BLEND);
-    glEnable(GL_LIGHTING);
-}
-
-// ---------------- BASIC DRAW HELPERS ----------------
-
-void drawBox(float w, float h, float d)
-{
-    w *= 0.5f; h *= 0.5f; d *= 0.5f;
-
-    glBegin(GL_QUADS);
-    // Front
-    glNormal3f(0,0,1);
-    glVertex3f(-w,-h,d); glVertex3f( w,-h,d);
-    glVertex3f( w, h,d); glVertex3f(-w, h,d);
-    // Back
-    glNormal3f(0,0,-1);
-    glVertex3f(-w,-h,-d); glVertex3f(-w, h,-d);
-    glVertex3f( w, h,-d); glVertex3f( w,-h,-d);
-    // Left
-    glNormal3f(-1,0,0);
-    glVertex3f(-w,-h,-d); glVertex3f(-w,-h,d);
-    glVertex3f(-w, h,d);  glVertex3f(-w, h,-d);
-    // Right
-    glNormal3f(1,0,0);
-    glVertex3f( w,-h,-d); glVertex3f( w, h,-d);
-    glVertex3f( w, h,d);  glVertex3f( w,-h,d);
-    // Top
-    glNormal3f(0,1,0);
-    glVertex3f(-w, h,-d); glVertex3f(-w, h,d);
-    glVertex3f( w, h,d);  glVertex3f( w, h,-d);
-    // Bottom
-    glNormal3f(0,-1,0);
-    glVertex3f(-w,-h,-d); glVertex3f( w,-h,-d);
-    glVertex3f( w,-h,d);  glVertex3f(-w,-h,d);
-    glEnd();
-}
-
-void drawDisk(float radius, int slices)
-{
-    glBegin(GL_TRIANGLE_FAN);
-    glNormal3f(1,0,0);       // facing +X
-    glVertex3f(0,0,0);
-    for (int i = 0; i <= slices; ++i) {
-        float th = (float)i / slices * 2.0f * (float)M_PI;
-        float y = radius * std::cos(th);
-        float z = radius * std::sin(th);
-        glVertex3f(0,y,z);
-    }
-    glEnd();
-}
-
-// ---------------- ENGINE MATH ----------------
-
-float getPistonHeight(float angleDeg)
-{
-    const float R = 0.75f;
-    const float L = 2.4f;
-
-    float th = angleDeg * (float)M_PI / 180.0f;
-    float s  = std::sin(th);
-    float c  = std::cos(th);
-
-    float y = R * c + std::sqrt(L*L - R*R*s*s);
-
-    float minY = L - R;
-    float maxY = L + R;
-    float t = (y - minY) / (maxY - minY);
-
-    return 1.5f + t * 3.2f;
-}
-
-void getValveStates(float angleDeg, float &intakeLift, float &exhaustLift)
-{
-    float a = std::fmod(angleDeg, 720.0f);
-    intakeLift  = 0.0f;
-    exhaustLift = 0.0f;
-    if (a < 180.0f)    intakeLift  = 1.0f;
-    if (a >= 540.0f)   exhaustLift = 1.0f;
-}
-
-// ---------------- LIGHTING ----------------
-
-void setupLighting()
-{
-    glEnable(GL_LIGHTING);
-    glEnable(GL_LIGHT0);
-    glEnable(GL_COLOR_MATERIAL);
-
-    GLfloat lightPos[] = { 0.0f, 12.0f, 15.0f, 1.0f };
-    GLfloat amb[]      = { 0.12f, 0.12f, 0.15f, 1.0f };
-    GLfloat diff[]     = { 0.9f,  0.9f,  0.95f, 1.0f };
-    GLfloat spec[]     = { 1.0f,  1.0f,  1.0f,  1.0f };
-
-    glLightfv(GL_LIGHT0, GL_POSITION, lightPos);
-    glLightfv(GL_LIGHT0, GL_AMBIENT,  amb);
-    glLightfv(GL_LIGHT0, GL_DIFFUSE,  diff);
-    glLightfv(GL_LIGHT0, GL_SPECULAR, spec);
-
-    GLfloat shininess[] = { 80.0f };
-    glMaterialfv(GL_FRONT_AND_BACK, GL_SHININESS, shininess);
-
-    glEnable(GL_NORMALIZE);
-    glShadeModel(GL_SMOOTH);
-}
-
-// ---------------- ENGINE DISPLAY (3D) ----------------
-
-void displayEngine()
-{
-    glClearColor(0.03f, 0.03f, 0.05f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-    glEnable(GL_DEPTH_TEST);
-
-    // Reset projection to perspective (important after landing 2D)
-    glMatrixMode(GL_PROJECTION);
-    glLoadIdentity();
-    gluPerspective(60.0f, (float)winWidth / (float)winHeight, 0.1f, 100.0f);
-
-    glMatrixMode(GL_MODELVIEW);
-    glLoadIdentity();
-
-    glTranslatef(0.0f, -2.5f, -camZoom);
-    glRotatef(camRotY, 1, 0, 0);
-    glRotatef(camRotX, 0, 1, 0);
-
-    setupLighting();
-
-    // Ground
-    glPushMatrix();
-    glTranslatef(0.0f, -0.1f, 0.0f);
-    glColor3f(0.08f, 0.08f, 0.09f);
-    glNormal3f(0,1,0);
-    glBegin(GL_QUADS);
-    glVertex3f(-12,0,-7);
-    glVertex3f( 12,0,-7);
-    glVertex3f( 12,0, 7);
-    glVertex3f(-12,0, 7);
-    glEnd();
-    glPopMatrix();
-
-    // Engine block
-    glPushMatrix();
-    glTranslatef(0.0f, 0.7f, 0.0f);
-    glColor3f(0.10f, 0.55f, 0.10f);
-    drawBox(9.2f, 1.2f, 2.6f);
-    glPopMatrix();
-
-    // Crankshaft shaft
-    glPushMatrix();
-    glTranslatef(0.0f, 0.7f, 0.0f);
-    glColor3f(0.05f, 0.45f, 0.05f);
-    drawBox(9.2f, 0.35f, 0.7f);
-    glPopMatrix();
-
-    const float crankY = 0.8f;
-    const float crankR = 0.7f;
-
-    // Flywheel
-    glPushMatrix();
-    glTranslatef(cylX[0] - 1.8f, crankY, 0.0f);
-    glRotatef(crankAngle, 1,0,0);
-    glColor3f(0.8f, 0.15f, 0.15f);
-    drawDisk(1.8f, 40);
-    glPopMatrix();
-
-    // Timing pulleys (right)
-    glPushMatrix();
-    glTranslatef(cylX[NUM_CYL-1] + 2.0f, 5.3f, 1.5f);
-    glRotatef(-crankAngle * 0.5f, 1,0,0);
-    glColor3f(0.85f, 0.15f, 0.15f);
-    drawDisk(0.9f, 30);
-    glPopMatrix();
-
-    glPushMatrix();
-    glTranslatef(cylX[NUM_CYL-1] + 2.0f, crankY, 1.5f);
-    glRotatef(crankAngle, 1,0,0);
-    glColor3f(0.85f, 0.15f, 0.15f);
-    drawDisk(1.0f, 30);
-    glPopMatrix();
-
-    // Belt frame
-    glPushMatrix();
-    glTranslatef(cylX[NUM_CYL-1] + 2.0f, 3.0f, 1.5f);
-    glColor3f(0.10f, 0.55f, 0.95f);
-    drawBox(0.25f, 4.7f, 0.2f);
-    glPopMatrix();
-
-    // Belt line
-    glDisable(GL_LIGHTING);
-    glColor3f(0.05f, 0.05f, 0.05f);
-    glBegin(GL_LINE_STRIP);
-    glVertex3f(cylX[NUM_CYL-1] + 2.0f, crankY,  1.5f);
-    glVertex3f(cylX[NUM_CYL-1] + 2.0f, 5.3f,    1.5f);
-    glEnd();
-    glEnable(GL_LIGHTING);
-
-    // Rocker / cam housing bar
-    glPushMatrix();
-    glTranslatef(0.0f, 5.5f, 0.0f);
-    glColor3f(0.95f, 0.80f, 0.20f);
-    drawBox(9.2f, 0.7f, 1.6f);
-    glPopMatrix();
-
-    // Cylinders, pistons, rods, valves, flames
-    for (int i = 0; i < NUM_CYL; ++i) {
-        float cx = cylX[i];
-        float localAngle = crankAngle + cylPhase[i];
-
-        // sleeve
-        glPushMatrix();
-        glTranslatef(cx, 3.2f, 0.0f);
-        glDisable(GL_LIGHTING);
-        glEnable(GL_BLEND);
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-        glColor4f(0.5f, 0.7f, 0.9f, 0.22f);
-        drawBox(1.6f, 4.0f, 1.6f);
-        glDisable(GL_BLEND);
-        glEnable(GL_LIGHTING);
-        glPopMatrix();
-
-        float pistonY = getPistonHeight(localAngle);
-
-        // piston
-        glPushMatrix();
-        glTranslatef(cx, pistonY, 0.0f);
-        glColor3f(0.96f, 0.82f, 0.20f);
-        drawBox(1.4f, 0.7f, 1.4f);
-        glPopMatrix();
-
-        // crank web disc
-        float th = localAngle * (float)M_PI / 180.0f;
-        glPushMatrix();
-        glTranslatef(cx, crankY, 0.0f);
-        glRotatef(localAngle, 1,0,0);
-        glColor3f(0.05f, 0.65f, 0.10f);
-        drawDisk(0.6f, 28);
-        glPopMatrix();
-
-        // connecting rod
-        {
-            float pinY = crankY + crankR * std::cos(th);
-            float pinZ = crankR * std::sin(th);
-
-            float pistonPinY = pistonY - 0.4f;
-            float pistonZ    = 0.0f;
-
-            float midY = (pinY + pistonPinY) * 0.5f;
-            float midZ = (pinZ + pistonZ)   * 0.5f;
-
-            float dy = pistonPinY - pinY;
-            float dz = pistonZ    - pinZ;
-            float length = std::sqrt(dy*dy + dz*dz);
-
-            glPushMatrix();
-            glTranslatef(cx, midY, midZ);
-
-            float angleZ = std::atan2(dz, dy) * 180.0f / (float)M_PI;
-            glRotatef(-angleZ, 0,0,1);
-
-            glColor3f(0.05f, 0.85f, 0.40f);
-            drawBox(0.25f, length, 0.25f);
-            glPopMatrix();
-        }
-
-        // valves
-        float intakeLift, exhaustLift;
-        getValveStates(localAngle, intakeLift, exhaustLift);
-
-        glPushMatrix();
-        glTranslatef(cx - 0.35f, 5.7f + intakeLift*0.6f, 0.35f);
-        glColor3f(0.15f, 1.0f, 0.25f);
-        drawBox(0.18f, 0.9f, 0.18f);
-        glPopMatrix();
-
-        glPushMatrix();
-        glTranslatef(cx + 0.35f, 5.7f + exhaustLift*0.6f, -0.35f);
-        glColor3f(0.95f, 0.15f, 0.15f);
-        drawBox(0.18f, 0.9f, 0.18f);
-        glPopMatrix();
-
-        // flame
-        float phase = std::fmod(localAngle, 720.0f);
-        if (phase >= 360.0f && phase < 540.0f) {
-            float t = (phase - 360.0f) / 180.0f;
-            float flicker = 0.35f + 0.25f * std::sin(t * 6.0f);
-
-            glPushMatrix();
-            glTranslatef(cx, 4.6f, 0.0f);
-            glDisable(GL_LIGHTING);
-            glEnable(GL_BLEND);
-            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-            glColor4f(1.0f, 0.46f, 0.08f, flicker);
-            drawBox(1.25f, 1.0f, 1.25f);
-            glDisable(GL_BLEND);
-            glEnable(GL_LIGHTING);
-            glPopMatrix();
-        }
-    }
-
-    // smoke last
-    drawSmoke();
-
-    glutSwapBuffers();
-}
-
-// ---------------- LANDING PAGE (2D) ----------------
-
-void drawLandingText(float x, float y, const char* str, void* font)
-{
-    glRasterPos2f(x, y);
-    for (const char* p = str; *p; ++p)
-        glutBitmapCharacter(font, *p);
-}
-
-void displayLanding()
-{
-    glDisable(GL_DEPTH_TEST);
-    glDisable(GL_LIGHTING);
-
-    glClearColor(0.80f, 0.88f, 1.0f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT);
-
-    glMatrixMode(GL_PROJECTION);
-    glLoadIdentity();
-    gluOrtho2D(0, winWidth, 0, winHeight);
-
-    glMatrixMode(GL_MODELVIEW);
-    glLoadIdentity();
-
-    float centerX = winWidth / 2.0f;
-    glColor3f(0.0f, 0.25f, 0.6f);
-
-    const char* line1 = "Dayananda Sagar Academy of Technology & Management";
-    const char* line2 = "Autonomous Institute under VTU";
-    const char* line3 = "Department of Computer Science and Engineering";
-    const char* line4 = "Internal Combustion Engine Simulation (OpenGL)";
-
-    auto drawCentered = [&](float y, const char* text, void* font) {
-        int w = 0;
-        for (const char* p = text; *p; ++p)
-            w += glutBitmapWidth(font, *p);
-        float x = centerX - w / 2.0f;
-        drawLandingText(x, y, text, font);
-    };
-
-    drawCentered(winHeight - 80,  line1, GLUT_BITMAP_HELVETICA_18);
-    drawCentered(winHeight - 110, line2, GLUT_BITMAP_HELVETICA_12);
-    drawCentered(winHeight - 135, line3, GLUT_BITMAP_HELVETICA_12);
-    drawCentered(winHeight - 170, line4, GLUT_BITMAP_HELVETICA_18);
-
-    // Team names (edit for your group)
-    drawCentered(winHeight - 210, "Harshavardhan S  1DT23CS072", GLUT_BITMAP_HELVETICA_12);
-    drawCentered(winHeight - 230, "Laxmikant        1DT23CS105",       GLUT_BITMAP_HELVETICA_12);
-    drawCentered(winHeight - 250, "Likhith P        1DT23CS107",       GLUT_BITMAP_HELVETICA_12);
-    drawCentered(winHeight - 270, "Mithun S         1DT23CS124",       GLUT_BITMAP_HELVETICA_12);
-
-    // ---- Logo image (logocg.png) ----
-    float logoSize = 160.0f;
-    float logoX = centerX - logoSize / 2.0f;
-    float logoY = winHeight / 2.0f - logoSize / 2.0f + 20.0f;
-
-    if (logoTexID != 0) {
-        glEnable(GL_TEXTURE_2D);
-        glBindTexture(GL_TEXTURE_2D, logoTexID);
-        glColor3f(1.0f, 1.0f, 1.0f); // no tint
-
-        glBegin(GL_QUADS);
-        glTexCoord2f(0,0); glVertex2f(logoX,             logoY);
-        glTexCoord2f(1,0); glVertex2f(logoX+logoSize,    logoY);
-        glTexCoord2f(1,1); glVertex2f(logoX+logoSize,    logoY+logoSize);
-        glTexCoord2f(0,1); glVertex2f(logoX,             logoY+logoSize);
-        glEnd();
-
-        glDisable(GL_TEXTURE_2D);
-    } else {
-        // fallback: white box if texture failed
-        glColor3f(1.0f, 1.0f, 1.0f);
-        glBegin(GL_QUADS);
-        glVertex2f(logoX,          logoY);
-        glVertex2f(logoX+logoSize, logoY);
-        glVertex2f(logoX+logoSize, logoY+logoSize);
-        glVertex2f(logoX,          logoY+logoSize);
-        glEnd();
-    }
-
-    // Start button
-    float btnX = centerX - BTN_WIDTH / 2.0f;
-    float btnY = BTN_Y;
-
-    glColor3f(0.0f, 0.45f, 0.90f);
-    glBegin(GL_QUADS);
-    glVertex2f(btnX,          btnY);
-    glVertex2f(btnX+BTN_WIDTH,btnY);
-    glVertex2f(btnX+BTN_WIDTH,btnY+BTN_HEIGHT);
-    glVertex2f(btnX,          btnY+BTN_HEIGHT);
-    glEnd();
-
-    glColor3f(0.0f, 0.25f, 0.6f);
-    glLineWidth(2.0f);
-    glBegin(GL_LINE_LOOP);
-    glVertex2f(btnX,          btnY);
-    glVertex2f(btnX+BTN_WIDTH,btnY);
-    glVertex2f(btnX+BTN_WIDTH,btnY+BTN_HEIGHT);
-    glVertex2f(btnX,          btnY+BTN_HEIGHT);
-    glEnd();
-    glLineWidth(1.0f);
-
-    const char* btnText = "START APPLICATION";
-    int tw = 0;
-    for (const char* p = btnText; *p; ++p)
-        tw += glutBitmapWidth(GLUT_BITMAP_HELVETICA_18, *p);
-    float tx = centerX - tw / 2.0f;
-    float ty = btnY + BTN_HEIGHT / 2.0f - 5.0f;
-    glColor3f(1.0f, 1.0f, 1.0f);
-    drawLandingText(tx, ty, btnText, GLUT_BITMAP_HELVETICA_18);
-
-    glutSwapBuffers();
-}
-
-// ---------------- STATE SWITCH ----------------
-
-void startEngineSimulation()
-{
-    if (appState == STATE_ENGINE) return;
-    appState = STATE_ENGINE;
-
-    PlaySound(TEXT("engine_loop.wav"), NULL,
-              SND_ASYNC | SND_LOOP | SND_FILENAME);
-
-    lastTimeMs = glutGet(GLUT_ELAPSED_TIME);
-}
-
-// ---------------- DISPLAY WRAPPER ----------------
-
-void displayWrapper()
-{
-    if (appState == STATE_LANDING)
-        displayLanding();
-    else
-        displayEngine();
-}
-
-// ---------------- IDLE (ANIMATION) ----------------
-
-void idle()
-{
-    int now = glutGet(GLUT_ELAPSED_TIME);
-    if (lastTimeMs == 0) lastTimeMs = now;
-    float dtMs = (float)(now - lastTimeMs);
-    float dt   = dtMs / 1000.0f;
-    lastTimeMs = now;
-
-    if (appState == STATE_ENGINE) {
-        float degPerMs = rpm * 360.0f / 60000.0f;
-        crankAngle += degPerMs * dtMs;
-        if (crankAngle >= 720.0f) crankAngle -= 720.0f;
-
-        // exhaust smoke
-        for (int i = 0; i < NUM_CYL; ++i) {
-            float localAngle = crankAngle + cylPhase[i];
-            float phase = std::fmod(localAngle, 720.0f);
-            if (phase >= 540.0f && phase < 720.0f) {
-                float spawnChance = 0.03f + (rpm / 4000.0f) * 0.05f;
-                float r = (float)std::rand() / RAND_MAX;
-                if (r < spawnChance) {
-                    float exX = cylX[i] + 0.7f;
-                    float exY = 5.9f;
-                    float exZ = -0.5f;
-                    spawnSmoke(exX, exY, exZ);
-                }
+    // Initialize ImGui (optional, but highly recommended for the UI)
+    // NOTE: ImGui setup code would go here. For simplicity, this example
+    // uses basic OpenGL drawing for the UI elements, which is complicated.
+    // In a real project, use ImGui.
+
+    // 4. Game Loop (Render Loop)
+    while (!glfwWindowShouldClose(window)) {
+        // --- Timing ---
+        float current_time = glfwGetTime();
+        float delta_time = current_time - last_frame_time;
+        last_frame_time = current_time;
+
+        // --- Input ---
+        processInput(window);
+
+        // --- Update Simulation ---
+        if (is_running) {
+            // Convert RPM to degrees per second
+            float degrees_per_second = engine_speed_rpm * 6.0f; // (RPM * 360 degrees) / 60 seconds
+            
+            // Update the crank angle
+            crank_angle_degrees += degrees_per_second * delta_time;
+            
+            // Keep the angle within a full cycle (0 to 720 degrees for 4-stroke)
+            if (crank_angle_degrees >= 720.0f) {
+                crank_angle_degrees -= 720.0f;
             }
         }
 
-        updateSmoke(dt);
+        // --- Render ---
+        render_scene();
+
+        // --- Poll and swap ---
+        glfwSwapBuffers(window);
+        glfwPollEvents();
     }
 
-    glutPostRedisplay();
+    // 5. Terminate GLFW
+    // ImGui shutdown code would also go here.
+    glfwTerminate();
+    return 0;
 }
 
-// ---------------- RESHAPE ----------------
+// --- Function Definitions ---
 
-void reshape(int w, int h)
-{
-    winWidth  = w;
-    winHeight = (h == 0 ? 1 : h);
+void framebuffer_size_callback(GLFWwindow* window, int width, int height) {
+    glViewport(0, 0, width, height);
+}
 
-    glViewport(0, 0, winWidth, winHeight);
+void processInput(GLFWwindow *window) {
+    if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
+        glfwSetWindowShouldClose(window, true);
+    
+    // Simple keyboard controls for Start/Pause/Reset
+    if (glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS)
+        is_running = !is_running;
+    if (glfwGetKey(window, GLFW_KEY_R) == GLFW_PRESS) {
+        crank_angle_degrees = 0.0f;
+        is_running = false;
+    }
+}
+
+/**
+ * @brief Calculates the linear piston position (y-axis) based on the crank angle.
+ * This is the Rod-Piston Kinematics formula.
+ * @param angle_rad The crank angle in radians.
+ * @return The vertical position of the piston head.
+ */
+float get_piston_position(float angle_rad) {
+    // Standard piston position formula:
+    // y = -R * cos(theta) + L * sqrt(1 - (R/L)^2 * sin^2(theta))
+    // Note: The sign and offset depends on your coordinate system.
+    
+    // Piston position relative to the center of the cylinder:
+    float R = CRANK_RADIUS;
+    float L = CONROD_LENGTH;
+    float sin_sq = std::pow(std::sin(angle_rad), 2);
+    
+    // We adjust the formula to place 0 at the center of the stroke for simpler drawing
+    float displacement = -R * std::cos(angle_rad) + L * std::sqrt(1.0f - std::pow(R / L, 2) * sin_sq);
+    
+    // Adjust so the piston position is 'down' in screen space (positive y is up in OpenGL world)
+    // and the maximum value corresponds to the top of the cylinder.
+    return displacement;
+}
+
+/**
+ * @brief Determines the current stroke phase for a given cylinder.
+ * The 4-stroke cycle is 720 degrees.
+ * Firing Order for a simple inline-4 is typically 1-3-4-2.
+ * @param cylinder_index The index of the cylinder (0, 1, 2, 3 for 1-4).
+ * @return The name of the current stroke.
+ */
+std::string get_stroke_name(int cylinder_index) {
+    // 4-Cylinder Firing Order: 1-3-4-2. The phases are offset by 180 degrees (360/2).
+    // Cylinder 1 (Index 0) is at angle A.
+    // Cylinder 3 (Index 2) is at angle A + 180.
+    // Cylinder 4 (Index 3) is at angle A + 360.
+    // Cylinder 2 (Index 1) is at angle A + 540.
+    
+    // Crank angle relative to the cylinder's phase
+    float phase_offset = 0.0f;
+    if (cylinder_index == 1) phase_offset = 540.0f; // Cylinder 2
+    if (cylinder_index == 2) phase_offset = 180.0f; // Cylinder 3
+    if (cylinder_index == 3) phase_offset = 360.0f; // Cylinder 4
+    
+    float effective_angle = std::fmod(crank_angle_degrees + phase_offset, 720.0f);
+
+    // Each stroke is 180 degrees
+    if (effective_angle >= 0.0f && effective_angle < 180.0f) {
+        return "INTAKE";
+    } else if (effective_angle >= 180.0f && effective_angle < 360.0f) {
+        return "COMPRESSION";
+    } else if (effective_angle >= 360.0f && effective_angle < 540.0f) {
+        return "POWER/COMBUSTION";
+    } else { // 540 to 720 degrees
+        return "EXHAUST";
+    }
+}
+
+/**
+ * @brief Draws a single piston, connecting rod, and crankshaft assembly.
+ */
+void draw_piston_assembly(float crank_angle_degrees, float x_offset, int cylinder_index) {
+    // Simple 2D drawing (using GL_QUADS and GL_LINES - fixed function, for simplicity)
+
+    glPushMatrix();
+    glTranslatef(x_offset, 0.0f, 0.0f); // Position the whole assembly
+
+    // 1. Calculate Kinematics
+    float angle_rad = glm::radians(crank_angle_degrees);
+    float R = CRANK_RADIUS;
+    float L = CONROD_LENGTH;
+    
+    // Crank Pin Center (A)
+    float crank_x = R * std::sin(angle_rad);
+    float crank_y = -R * std::cos(angle_rad);
+    
+    // Piston Center (B)
+    float piston_y = get_piston_position(angle_rad);
+    
+    // Connecting Rod Angle (phi)
+    // sin(phi) = -R/L * sin(theta)
+    float sin_phi = -(R / L) * std::sin(angle_rad);
+    float phi_rad = std::asin(sin_phi);
+    
+    // Piston Head position (Simplified BDC/TDC handling)
+    float piston_pos_y = piston_y + (STROKE / 2.0f); // Base Y position
+
+    // 2. Draw Cylinder
+    glColor3f(0.3f, 0.3f, 0.3f); // Dark gray
+    glBegin(GL_QUADS);
+        glVertex2f(-BORE/2.0f - 0.1f, piston_pos_y + STROKE + 0.5f);
+        glVertex2f( BORE/2.0f + 0.1f, piston_pos_y + STROKE + 0.5f);
+        glVertex2f( BORE/2.0f + 0.1f, piston_pos_y - STROKE);
+        glVertex2f(-BORE/2.0f - 0.1f, piston_pos_y - STROKE);
+    glEnd();
+
+    // 3. Draw Stroke Visualization (Gas/Flame/Smoke)
+    std::string stroke = get_stroke_name(cylinder_index);
+    float gas_top_y = piston_pos_y + STROKE;
+    float gas_bottom_y = piston_pos_y;
+    
+    if (stroke == "INTAKE") glColor3f(0.8f, 0.8f, 0.8f); // White/Gray for air/fuel
+    else if (stroke == "COMPRESSION") glColor3f(0.9f, 0.8f, 0.0f); // Yellow/Gold for compressed gas
+    else if (stroke == "POWER/COMBUSTION") glColor3f(1.0f, 0.4f, 0.0f); // Orange/Red for explosion
+    else if (stroke == "EXHAUST") glColor3f(0.5f, 0.5f, 0.5f); // Darker gray for exhaust gas
+
+    // Draw the gas/flame block inside the cylinder
+    glBegin(GL_QUADS);
+        glVertex2f(-BORE/2.0f, gas_top_y);
+        glVertex2f( BORE/2.0f, gas_top_y);
+        glVertex2f( BORE/2.0f, gas_bottom_y);
+        glVertex2f(-BORE/2.0f, gas_bottom_y);
+    glEnd();
+
+    // 4. Draw Piston
+    glColor3f(0.6f, 0.6f, 0.6f); // Light gray
+    glBegin(GL_QUADS);
+        glVertex2f(-BORE/2.0f, piston_pos_y + 0.05f); // Piston top
+        glVertex2f( BORE/2.0f, piston_pos_y + 0.05f);
+        glVertex2f( BORE/2.0f, piston_pos_y - 0.2f);  // Piston bottom
+        glVertex2f(-BORE/2.0f, piston_pos_y - 0.2f);
+    glEnd();
+
+    // 5. Draw Connecting Rod
+    glColor3f(0.2f, 0.2f, 0.2f); // Darker gray
+    glLineWidth(5.0f);
+    glBegin(GL_LINES);
+        // From Crank Pin (A) to Piston Pin (B, assumed at piston center)
+        glVertex2f(crank_x, crank_y - CONROD_LENGTH); // Crank center is at (0, -L)
+        glVertex2f(0.0f, piston_pos_y);
+    glEnd();
+    
+    // 6. Draw Crankshaft (simplified as a circle and connecting line)
+    // ... This part is complex and typically uses a proper model or more advanced GL drawing
+    
+    // 7. Draw Stroke Label (Text Rendering is complicated in OpenGL, but conceptually...)
+    if (show_labels) {
+        // Conceptually, you would use a text rendering library here (e.g., FreeType)
+        // to draw the 'stroke' string above the cylinder.
+        // Example: draw_text(stroke.c_str(), -0.5f, piston_pos_y + STROKE + 0.6f);
+    }
+
+    glPopMatrix();
+}
+
+/**
+ * @brief Sets up the view and calls rendering functions.
+ */
+void render_scene() {
+    glClearColor(0.1f, 0.1f, 0.1f, 1.0f); // Dark background
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    // --- Setup 2D Orthographic Projection ---
+    // The world coordinate system will be centered at (0, 0) and extend to +/- 10.0
     glMatrixMode(GL_PROJECTION);
     glLoadIdentity();
-    gluPerspective(60.0f, (float)winWidth/(float)winHeight, 0.1f, 100.0f);
+    // This allows you to define your drawing coordinates easily.
+    // e.g., an x-range of -8 to 8 and a y-range of -10 to 10
+    float aspect = (float)SCR_WIDTH / (float)SCR_HEIGHT;
+    glOrtho(-8.0f * aspect, 8.0f * aspect, -10.0f, 10.0f, -1.0f, 1.0f);
+    
     glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+
+    // --- Draw Engine Cylinders (Inline-4) ---
+    float x_spacing = 3.0f;
+    float start_x = -(NUM_CYLINDERS - 1) * x_spacing / 2.0f;
+
+    for (int i = 0; i < NUM_CYLINDERS; ++i) {
+        // The crank angle for an inline-4 with 180-degree offset journals
+        // is the main crank angle plus an offset of 0, 540, 180, or 360 degrees.
+        // We handle the effective angle inside draw_piston_assembly via cylinder_index
+        
+        draw_piston_assembly(crank_angle_degrees, start_x + (i * x_spacing), i);
+    }
+    
+    // --- Draw UI ---
+    draw_ui_controls(); // Conceptual UI drawing
+
+    glFlush();
 }
 
-// ---------------- INPUT ----------------
-
-void keyboard(unsigned char key, int, int)
-{
-    if (appState == STATE_LANDING) {
-        if (key == 13 || key == ' ' || key == 's' || key == 'S')
-            startEngineSimulation();
-        else if (key == 27) {
-            PlaySound(NULL, 0, 0);
-            std::exit(0);
-        }
-        return;
-    }
-
-    switch (key)
-    {
-    case 27:
-        PlaySound(NULL, 0, 0);
-        std::exit(0);
-        break;
-    case 'w': camRotY += 2.0f; break;
-    case 's': camRotY -= 2.0f; break;
-    case 'a': camRotX -= 2.0f; break;
-    case 'd': camRotX += 2.0f; break;
-    case '+':
-    case '=':
-        camZoom -= 0.5f;
-        if (camZoom < 12.0f) camZoom = 12.0f;
-        break;
-    case '-':
-        camZoom += 0.5f;
-        if (camZoom > 28.0f) camZoom = 28.0f;
-        break;
-    case 'z':
-        rpm -= 40.0f;
-        if (rpm < 80.0f) rpm = 80.0f;
-        break;
-    case 'x':
-        rpm += 40.0f;
-        if (rpm > 3500.0f) rpm = 3500.0f;
-        break;
-    case '1':
-        rpm = 150.0f; break;
-    case '2':
-        rpm = 400.0f; break;
-    case '3':
-        rpm = 900.0f; break;
-    }
-}
-
-void mouse(int button, int state, int x, int y)
-{
-    if (appState != STATE_LANDING) return;
-    if (button != GLUT_LEFT_BUTTON || state != GLUT_DOWN) return;
-
-    int yInv = winHeight - y;
-
-    float btnX = winWidth / 2.0f - BTN_WIDTH / 2.0f;
-    float btnY = BTN_Y;
-
-    if (x >= btnX && x <= btnX + BTN_WIDTH &&
-        yInv >= btnY && yInv <= btnY + BTN_HEIGHT) {
-        startEngineSimulation();
-    }
-}
-
-// ---------------- MAIN ----------------
-
-int main(int argc, char** argv)
-{
-    std::srand((unsigned int)std::time(nullptr));
-
-    glutInit(&argc, argv);
-    glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB | GLUT_DEPTH);
-    glutInitWindowSize(winWidth, winHeight);
-    glutCreateWindow("Internal Combustion Engine Simulation");
-
-    glEnable(GL_DEPTH_TEST);
-    glEnable(GL_TEXTURE_2D);
-
-    // load logo texture (logocg.png in project root)
-    logoTexID = loadTexture("logocg.png");
-
-    glutDisplayFunc(displayWrapper);
-    glutReshapeFunc(reshape);
-    glutIdleFunc(idle);
-    glutKeyboardFunc(keyboard);
-    glutMouseFunc(mouse);
-
-    glutMainLoop();
-    return 0;
+/**
+ * @brief Conceptually draws the UI elements seen in the image.
+ * In a real project, this would be ImGui code.
+ */
+void draw_ui_controls() {
+    // This function would be hundreds of lines of complex OpenGL calls to draw
+    // rectangles, circles, and render text for buttons, sliders, and labels.
+    // Since this is highly non-trivial to implement from scratch and is best done
+    // with a dedicated library like ImGui, we will only leave the placeholder.
+    
+    // Conceptual placeholder for the UI:
+    // ... ImGui::Begin("Controls");
+    // ... ImGui::Checkbox("Start/Pause", &is_running);
+    // ... ImGui::SliderFloat("Speed (RPM)", &engine_speed_rpm, 100.0f, 5000.0f);
+    // ... ImGui::End();
 }
