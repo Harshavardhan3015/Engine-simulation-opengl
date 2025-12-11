@@ -1,331 +1,450 @@
-#include <iostream>
+// engine_sim.cpp
+// 4-Cylinder Engine Simulation with Landing Page (OpenGL + GLUT / freeglut)
+// Includes centering so the engine is always centered in the window.
+// Compile (Linux):
+//   g++ src/engine_sim.cpp -o engine_sim -lGL -lGLU -lglut
+// Windows MinGW (MSYS2):
+//   g++ src/engine_sim.cpp -o engine_sim.exe -lfreeglut -lopengl32 -lglu32
+// Windows MSVC (Developer Command Prompt):
+//   cl /EHsc src\engine_sim.cpp /Fe:engine_sim.exe freeglut.lib opengl32.lib glu32.lib
+
+#include <GL/glut.h>
 #include <cmath>
-#include <vector>
+#include <ctime>
+#include <string>
+#include <algorithm>
 
-// --- Third-party Library Headers ---
-// You will need to install and link these libraries.
-#include <GL/glew.h>  // GLEW for managing OpenGL extensions
-#include <GLFW/glfw3.h> // GLFW for creating the window and context
-#include <glm/glm.hpp>  // GLM for vector math (useful for transformations)
-#include <glm/gtc/matrix_transform.hpp>
+// MSVC does not always define M_PI, M_PI_2 — define manually if missing
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
-// --- Constants and Global Variables ---
+#ifndef M_PI_2
+#define M_PI_2 1.57079632679489661923
+#endif
 
-// Window settings
-const unsigned int SCR_WIDTH = 1200;
-const unsigned int SCR_HEIGHT = 800;
-const char* WINDOW_TITLE = "OpenGL Engine Simulation - 4 Stroke";
+// Window
+int winW = 900, winH = 360;
 
-// Engine simulation state
-float engine_speed_rpm = 1000.0f; // Current RPM
-float crank_angle_degrees = 0.0f; // Crankshaft angle (0 to 720 for a full cycle)
-bool is_running = false;
-bool show_labels = true;
+// Animation
+float crankAngle = 0.0f;            // degrees
+float crankSpeedDegPerSec = 90.0f;  // degrees per second (adjust speed)
+int lastTime = 0;
 
-// Engine geometry (simplified)
-const float BORE = 0.5f;       // Cylinder diameter
-const float STROKE = 1.0f;     // Total travel of the piston (2 * crank_radius)
-const float CRANK_RADIUS = 0.5f; // R
-const float CONROD_LENGTH = 2.0f; // L (must be > R)
-const int NUM_CYLINDERS = 4;
+// Engine geometry
+const float cylinderWidth = 120.0f;
+const float cylinderHeight = 160.0f;
+const float pistonWidth = 70.0f;
+const float pistonHeight = 90.0f;
+const int numCyl = 4;
+const float blockTopY = 220.0f;
+const float blockLeftX = 40.0f;
+const float spacing = 170.0f;
 
-// Time tracking for smooth movement
-float last_frame_time = 0.0f;
+// Visual stroke / mapping
+const float stroke = 80.0f;   // piston stroke (vertical travel)
+const float crankRadius = stroke / 2.0f;
+const float conRodLen = 120.0f;
 
-// --- Function Declarations ---
-void framebuffer_size_callback(GLFWwindow* window, int width, int height);
-void processInput(GLFWwindow *window);
-void render_scene();
-void draw_piston_assembly(float crank_angle_degrees, float x_offset, int cylinder_index);
-float get_piston_position(float angle_rad);
-std::string get_stroke_name(int cylinder_index);
-void draw_ui_controls();
+// UI States
+enum AppState { LANDING, ANIMATION };
+AppState appState = LANDING;
 
-// --- Main Function ---
+// Landing page button bounds (pixels)
+float btnX = 0, btnY = 0, btnW = 260, btnH = 56;
+bool hoverBtn = false;
 
-int main() {
-    // 1. Initialize GLFW
-    if (!glfwInit()) {
-        std::cerr << "Failed to initialize GLFW" << std::endl;
-        return -1;
-    }
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
-    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+//////////////////////////////////////////////////////////////////////////
+// Utility drawing helpers
+//////////////////////////////////////////////////////////////////////////
+void drawFilledRect(float cx, float cy, float w, float h) {
+    float x0 = cx - w/2.0f;
+    float y0 = cy - h/2.0f;
+    glBegin(GL_QUADS);
+      glVertex2f(x0, y0);
+      glVertex2f(x0 + w, y0);
+      glVertex2f(x0 + w, y0 + h);
+      glVertex2f(x0, y0 + h);
+    glEnd();
+}
 
-    // 2. Create a windowed mode window and its OpenGL context
-    GLFWwindow* window = glfwCreateWindow(SCR_WIDTH, SCR_HEIGHT, WINDOW_TITLE, NULL, NULL);
-    if (window == NULL) {
-        std::cerr << "Failed to create GLFW window" << std::endl;
-        glfwTerminate();
-        return -1;
-    }
-    glfwMakeContextCurrent(window);
-    glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
-
-    // 3. Initialize GLEW
-    if (glewInit() != GLEW_OK) {
-        std::cerr << "Failed to initialize GLEW" << std::endl;
-        return -1;
-    }
-
-    // Initialize ImGui (optional, but highly recommended for the UI)
-    // NOTE: ImGui setup code would go here. For simplicity, this example
-    // uses basic OpenGL drawing for the UI elements, which is complicated.
-    // In a real project, use ImGui.
-
-    // 4. Game Loop (Render Loop)
-    while (!glfwWindowShouldClose(window)) {
-        // --- Timing ---
-        float current_time = glfwGetTime();
-        float delta_time = current_time - last_frame_time;
-        last_frame_time = current_time;
-
-        // --- Input ---
-        processInput(window);
-
-        // --- Update Simulation ---
-        if (is_running) {
-            // Convert RPM to degrees per second
-            float degrees_per_second = engine_speed_rpm * 6.0f; // (RPM * 360 degrees) / 60 seconds
-            
-            // Update the crank angle
-            crank_angle_degrees += degrees_per_second * delta_time;
-            
-            // Keep the angle within a full cycle (0 to 720 degrees for 4-stroke)
-            if (crank_angle_degrees >= 720.0f) {
-                crank_angle_degrees -= 720.0f;
-            }
+void drawRoundedRect(float cx, float cy, float w, float h, float radius = 8.0f, int segments = 12) {
+    // simple rounded rectangle by drawing central rect + corner circles
+    drawFilledRect(cx, cy, w - 2*radius, h);
+    drawFilledRect(cx - (w/2.0f - radius), cy, 2*radius, h - 2*radius);
+    drawFilledRect(cx + (w/2.0f - radius), cy, 2*radius, h - 2*radius);
+    // corners
+    float corners[4][2] = {
+        {cx - w/2.0f + radius, cy - h/2.0f + radius},
+        {cx + w/2.0f - radius, cy - h/2.0f + radius},
+        {cx + w/2.0f - radius, cy + h/2.0f - radius},
+        {cx - w/2.0f + radius, cy + h/2.0f - radius}
+    };
+    for(int c=0;c<4;c++){
+        glBegin(GL_TRIANGLE_FAN);
+        glVertex2f(corners[c][0], corners[c][1]);
+        for(int i=0;i<=segments;i++){
+            float a = (float)i/segments * M_PI_2;
+            float ax = cosf(a) * radius;
+            float ay = sinf(a) * radius;
+            if(c==0) glVertex2f(corners[c][0] - ax, corners[c][1] - ay);
+            if(c==1) glVertex2f(corners[c][0] + ax, corners[c][1] - ay);
+            if(c==2) glVertex2f(corners[c][0] + ax, corners[c][1] + ay);
+            if(c==3) glVertex2f(corners[c][0] - ax, corners[c][1] + ay);
         }
-
-        // --- Render ---
-        render_scene();
-
-        // --- Poll and swap ---
-        glfwSwapBuffers(window);
-        glfwPollEvents();
-    }
-
-    // 5. Terminate GLFW
-    // ImGui shutdown code would also go here.
-    glfwTerminate();
-    return 0;
-}
-
-// --- Function Definitions ---
-
-void framebuffer_size_callback(GLFWwindow* window, int width, int height) {
-    glViewport(0, 0, width, height);
-}
-
-void processInput(GLFWwindow *window) {
-    if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
-        glfwSetWindowShouldClose(window, true);
-    
-    // Simple keyboard controls for Start/Pause/Reset
-    if (glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS)
-        is_running = !is_running;
-    if (glfwGetKey(window, GLFW_KEY_R) == GLFW_PRESS) {
-        crank_angle_degrees = 0.0f;
-        is_running = false;
+        glEnd();
     }
 }
 
-/**
- * @brief Calculates the linear piston position (y-axis) based on the crank angle.
- * This is the Rod-Piston Kinematics formula.
- * @param angle_rad The crank angle in radians.
- * @return The vertical position of the piston head.
- */
-float get_piston_position(float angle_rad) {
-    // Standard piston position formula:
-    // y = -R * cos(theta) + L * sqrt(1 - (R/L)^2 * sin^2(theta))
-    // Note: The sign and offset depends on your coordinate system.
-    
-    // Piston position relative to the center of the cylinder:
-    float R = CRANK_RADIUS;
-    float L = CONROD_LENGTH;
-    float sin_sq = std::pow(std::sin(angle_rad), 2);
-    
-    // We adjust the formula to place 0 at the center of the stroke for simpler drawing
-    float displacement = -R * std::cos(angle_rad) + L * std::sqrt(1.0f - std::pow(R / L, 2) * sin_sq);
-    
-    // Adjust so the piston position is 'down' in screen space (positive y is up in OpenGL world)
-    // and the maximum value corresponds to the top of the cylinder.
-    return displacement;
+void drawCircle(float cx, float cy, float r, int segments = 32) {
+    glBegin(GL_TRIANGLE_FAN);
+      glVertex2f(cx, cy);
+      for(int i=0;i<=segments;i++){
+          float a = (float)i/segments * 2.0f * M_PI;
+          glVertex2f(cx + cosf(a)*r, cy + sinf(a)*r);
+      }
+    glEnd();
 }
 
-/**
- * @brief Determines the current stroke phase for a given cylinder.
- * The 4-stroke cycle is 720 degrees.
- * Firing Order for a simple inline-4 is typically 1-3-4-2.
- * @param cylinder_index The index of the cylinder (0, 1, 2, 3 for 1-4).
- * @return The name of the current stroke.
- */
-std::string get_stroke_name(int cylinder_index) {
-    // 4-Cylinder Firing Order: 1-3-4-2. The phases are offset by 180 degrees (360/2).
-    // Cylinder 1 (Index 0) is at angle A.
-    // Cylinder 3 (Index 2) is at angle A + 180.
-    // Cylinder 4 (Index 3) is at angle A + 360.
-    // Cylinder 2 (Index 1) is at angle A + 540.
-    
-    // Crank angle relative to the cylinder's phase
-    float phase_offset = 0.0f;
-    if (cylinder_index == 1) phase_offset = 540.0f; // Cylinder 2
-    if (cylinder_index == 2) phase_offset = 180.0f; // Cylinder 3
-    if (cylinder_index == 3) phase_offset = 360.0f; // Cylinder 4
-    
-    float effective_angle = std::fmod(crank_angle_degrees + phase_offset, 720.0f);
+void drawText(const std::string &s, float x, float y, void* font = GLUT_BITMAP_HELVETICA_18) {
+    glRasterPos2f(x, y);
+    for(char c: s) glutBitmapCharacter(font, c);
+}
 
-    // Each stroke is 180 degrees
-    if (effective_angle >= 0.0f && effective_angle < 180.0f) {
-        return "INTAKE";
-    } else if (effective_angle >= 180.0f && effective_angle < 360.0f) {
-        return "COMPRESSION";
-    } else if (effective_angle >= 360.0f && effective_angle < 540.0f) {
-        return "POWER/COMBUSTION";
-    } else { // 540 to 720 degrees
-        return "EXHAUST";
+//////////////////////////////////////////////////////////////////////////
+// Engine drawing and animation
+//////////////////////////////////////////////////////////////////////////
+void drawCombustionEffect(float cx, float cy, float size, int kind) {
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    int layers = 6;
+    float timef = glutGet(GLUT_ELAPSED_TIME) / 1000.0f;
+    for(int i=0;i<layers;i++){
+        float t = (float)i/layers;
+        float r = size * (0.6f + t*0.8f);
+        float alpha = 0.18f * (1.0f - t) + 0.02f;
+        if(kind==0) glColor4f(0.95f, 0.95f, 0.55f, alpha); // faint yellow
+        else if(kind==1) glColor4f(0.6f, 0.6f, 0.6f, alpha); // compression (darkish cloud)
+        else if(kind==2) glColor4f(1.0f, 0.45f, 0.05f, alpha); // orange flame
+        else glColor4f(0.6f, 0.6f, 0.6f, alpha); // exhaust grey
+        float ox = (sinf(timef*1.5f + i*1.7f) * 6.0f * t) + (i*2.0f);
+        float oy = (cosf(timef*1.1f + i*2.9f) * 8.0f * t) + (i*4.0f);
+        drawCircle(cx + ox, cy + oy, r, 22);
     }
+    glDisable(GL_BLEND);
 }
 
-/**
- * @brief Draws a single piston, connecting rod, and crankshaft assembly.
- */
-void draw_piston_assembly(float crank_angle_degrees, float x_offset, int cylinder_index) {
-    // Simple 2D drawing (using GL_QUADS and GL_LINES - fixed function, for simplicity)
+void drawBlock() {
+    glColor3f(0.58f, 0.58f, 0.58f);
+    float blockW = spacing*(numCyl-1) + cylinderWidth + 80.0f;
+    float blockH = 220.0f;
+    drawFilledRect(blockLeftX + blockW/2.0f, blockTopY - blockH/2.0f + 20.0f, blockW, blockH);
+}
 
-    glPushMatrix();
-    glTranslatef(x_offset, 0.0f, 0.0f); // Position the whole assembly
+void drawCylinderAndPiston(int idx, float pistonCenterY, int phaseKind) {
+    float cx = blockLeftX + idx * spacing + cylinderWidth/2.0f + 20.0f;
+    float cyTop = blockTopY - cylinderHeight/2.0f;
 
-    // 1. Calculate Kinematics
-    float angle_rad = glm::radians(crank_angle_degrees);
-    float R = CRANK_RADIUS;
-    float L = CONROD_LENGTH;
-    
-    // Crank Pin Center (A)
-    float crank_x = R * std::sin(angle_rad);
-    float crank_y = -R * std::cos(angle_rad);
-    
-    // Piston Center (B)
-    float piston_y = get_piston_position(angle_rad);
-    
-    // Connecting Rod Angle (phi)
-    // sin(phi) = -R/L * sin(theta)
-    float sin_phi = -(R / L) * std::sin(angle_rad);
-    float phi_rad = std::asin(sin_phi);
-    
-    // Piston Head position (Simplified BDC/TDC handling)
-    float piston_pos_y = piston_y + (STROKE / 2.0f); // Base Y position
+    float innerW = pistonWidth + 6.0f;
+    float innerH = cylinderHeight - 10.0f;
+    glColor3f(0.33f,0.33f,0.33f);
+    drawFilledRect(cx, cyTop, innerW, innerH);
 
-    // 2. Draw Cylinder
-    glColor3f(0.3f, 0.3f, 0.3f); // Dark gray
-    glBegin(GL_QUADS);
-        glVertex2f(-BORE/2.0f - 0.1f, piston_pos_y + STROKE + 0.5f);
-        glVertex2f( BORE/2.0f + 0.1f, piston_pos_y + STROKE + 0.5f);
-        glVertex2f( BORE/2.0f + 0.1f, piston_pos_y - STROKE);
-        glVertex2f(-BORE/2.0f - 0.1f, piston_pos_y - STROKE);
+    glColor3f(0.18f,0.18f,0.18f);
+    glBegin(GL_LINE_LOOP);
+      float x0 = cx - innerW/2.0f;
+      float y0 = cyTop - innerH/2.0f;
+      glVertex2f(x0, y0);
+      glVertex2f(x0 + innerW, y0);
+      glVertex2f(x0 + innerW, y0 + innerH);
+      glVertex2f(x0, y0 + innerH);
     glEnd();
 
-    // 3. Draw Stroke Visualization (Gas/Flame/Smoke)
-    std::string stroke = get_stroke_name(cylinder_index);
-    float gas_top_y = piston_pos_y + STROKE;
-    float gas_bottom_y = piston_pos_y;
-    
-    if (stroke == "INTAKE") glColor3f(0.8f, 0.8f, 0.8f); // White/Gray for air/fuel
-    else if (stroke == "COMPRESSION") glColor3f(0.9f, 0.8f, 0.0f); // Yellow/Gold for compressed gas
-    else if (stroke == "POWER/COMBUSTION") glColor3f(1.0f, 0.4f, 0.0f); // Orange/Red for explosion
-    else if (stroke == "EXHAUST") glColor3f(0.5f, 0.5f, 0.5f); // Darker gray for exhaust gas
+    float pistonCX = cx;
+    float pistonCY = pistonCenterY;
+    glColor3f(0.15f,0.15f,0.15f);
+    drawFilledRect(pistonCX, pistonCY, pistonWidth, pistonHeight);
 
-    // Draw the gas/flame block inside the cylinder
-    glBegin(GL_QUADS);
-        glVertex2f(-BORE/2.0f, gas_top_y);
-        glVertex2f( BORE/2.0f, gas_top_y);
-        glVertex2f( BORE/2.0f, gas_bottom_y);
-        glVertex2f(-BORE/2.0f, gas_bottom_y);
-    glEnd();
-
-    // 4. Draw Piston
-    glColor3f(0.6f, 0.6f, 0.6f); // Light gray
-    glBegin(GL_QUADS);
-        glVertex2f(-BORE/2.0f, piston_pos_y + 0.05f); // Piston top
-        glVertex2f( BORE/2.0f, piston_pos_y + 0.05f);
-        glVertex2f( BORE/2.0f, piston_pos_y - 0.2f);  // Piston bottom
-        glVertex2f(-BORE/2.0f, piston_pos_y - 0.2f);
-    glEnd();
-
-    // 5. Draw Connecting Rod
-    glColor3f(0.2f, 0.2f, 0.2f); // Darker gray
-    glLineWidth(5.0f);
+    // piston top grooves
+    glColor3f(0.05f, 0.05f, 0.05f);
     glBegin(GL_LINES);
-        // From Crank Pin (A) to Piston Pin (B, assumed at piston center)
-        glVertex2f(crank_x, crank_y - CONROD_LENGTH); // Crank center is at (0, -L)
-        glVertex2f(0.0f, piston_pos_y);
+      glVertex2f(pistonCX - pistonWidth/2.0f + 6.0f, pistonCY + pistonHeight/4.0f);
+      glVertex2f(pistonCX + pistonWidth/2.0f - 6.0f, pistonCY + pistonHeight/4.0f);
+      glVertex2f(pistonCX - pistonWidth/2.0f + 8.0f, pistonCY);
+      glVertex2f(pistonCX + pistonWidth/2.0f - 8.0f, pistonCY);
     glEnd();
-    
-    // 6. Draw Crankshaft (simplified as a circle and connecting line)
-    // ... This part is complex and typically uses a proper model or more advanced GL drawing
-    
-    // 7. Draw Stroke Label (Text Rendering is complicated in OpenGL, but conceptually...)
-    if (show_labels) {
-        // Conceptually, you would use a text rendering library here (e.g., FreeType)
-        // to draw the 'stroke' string above the cylinder.
-        // Example: draw_text(stroke.c_str(), -0.5f, piston_pos_y + STROKE + 0.6f);
-    }
 
+    float effectY = pistonCY + pistonHeight/2.0f + 12.0f;
+    float effectSize = 18.0f + fabsf(sinf(crankAngle * M_PI/180.0f + idx * 0.9f) * 10.0f);
+    drawCombustionEffect(pistonCX, effectY, effectSize, phaseKind);
+}
+
+float pistonPositionForCrank(float baseTopY, float angleDeg, float phaseOffsetDeg) {
+    float a = (angleDeg + phaseOffsetDeg) * M_PI / 180.0f;
+    float R = crankRadius;
+    float disp = R - R * cosf(a);
+    float smallCOR = (1.0f - cosf(a)) * (R*0.15f);
+    float total = baseTopY - disp - smallCOR;
+    return total;
+}
+
+int getPhaseKindForCylinder(float angleDeg, float phaseOffsetDeg) {
+    float a = fmodf(angleDeg + phaseOffsetDeg, 720.0f);
+    if (a < 0) a += 720.0f;
+    if (a < 180.0f) return 0;
+    else if (a < 360.0f) return 1;
+    else if (a < 540.0f) return 2;
+    else return 3;
+}
+
+void drawCrankshaft(float x, float y, float length) {
+    glPushMatrix();
+      glColor3f(0.35f, 0.35f, 0.35f);
+      glBegin(GL_QUADS);
+        glVertex2f(x - length/2.0f, y - 8.0f);
+        glVertex2f(x + length/2.0f, y - 8.0f);
+        glVertex2f(x + length/2.0f, y + 8.0f);
+        glVertex2f(x - length/2.0f, y + 8.0f);
+      glEnd();
     glPopMatrix();
 }
 
-/**
- * @brief Sets up the view and calls rendering functions.
- */
-void render_scene() {
-    glClearColor(0.1f, 0.1f, 0.1f, 1.0f); // Dark background
-    glClear(GL_COLOR_BUFFER_BIT);
+//////////////////////////////////////////////////////////////////////////
+// Landing page drawing
+//////////////////////////////////////////////////////////////////////////
+void drawLandingPage() {
+    // Background slightly different
+    glClearColor(0.96f, 0.96f, 0.98f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-    // --- Setup 2D Orthographic Projection ---
-    // The world coordinate system will be centered at (0, 0) and extend to +/- 10.0
-    glMatrixMode(GL_PROJECTION);
-    glLoadIdentity();
-    // This allows you to define your drawing coordinates easily.
-    // e.g., an x-range of -8 to 8 and a y-range of -10 to 10
-    float aspect = (float)SCR_WIDTH / (float)SCR_HEIGHT;
-    glOrtho(-8.0f * aspect, 8.0f * aspect, -10.0f, 10.0f, -1.0f, 1.0f);
-    
-    glMatrixMode(GL_MODELVIEW);
-    glLoadIdentity();
+    // Title
+    glColor3f(0.12f, 0.12f, 0.12f);
+    std::string title = "4-Cylinder Engine Simulation";
+    float tx = 40.0f;
+    float ty = winH - 70.0f;
+    drawText(title, tx, ty, GLUT_BITMAP_TIMES_ROMAN_24);
 
-    // --- Draw Engine Cylinders (Inline-4) ---
-    float x_spacing = 3.0f;
-    float start_x = -(NUM_CYLINDERS - 1) * x_spacing / 2.0f;
+    // Subtitle / description
+    glColor3f(0.18f, 0.18f, 0.18f);
+    std::string desc = "Visualizes pistons, connecting rods, crankshaft and the 4-stroke cycle.";
+    drawText(desc, tx, ty - 30.0f, GLUT_BITMAP_HELVETICA_18);
+    std::string inst = "Click START or press Enter → Space toggles run/pause • 'f'/'s' adjust speed • 'm' return to menu";
+    drawText(inst, tx, ty - 52.0f, GLUT_BITMAP_HELVETICA_12);
 
-    for (int i = 0; i < NUM_CYLINDERS; ++i) {
-        // The crank angle for an inline-4 with 180-degree offset journals
-        // is the main crank angle plus an offset of 0, 540, 180, or 360 degrees.
-        // We handle the effective angle inside draw_piston_assembly via cylinder_index
-        
-        draw_piston_assembly(crank_angle_degrees, start_x + (i * x_spacing), i);
+    // center preview box with faint schematic (draw block + cylinders small)
+    float previewCX = winW - 360.0f;
+    float previewCY = winH/2.0f;
+    glColor3f(0.88f, 0.88f, 0.9f);
+    drawRoundedRect(previewCX, previewCY, 520.0f, 240.0f, 12.0f);
+    // small engine preview inside
+    float previewBlockLeft = previewCX - 220.0f;
+    float scaledSpacing = spacing * 0.6f;
+    float scaledCylW = cylinderWidth * 0.6f;
+    float previewTopY = previewCY + 20.0f;
+    // block
+    glColor3f(0.6f, 0.6f, 0.6f);
+    float pbW = scaledSpacing*(numCyl-1) + scaledCylW + 80.0f;
+    drawFilledRect(previewBlockLeft + pbW/2.0f, previewTopY - 60.0f, pbW, 160.0f);
+
+    // small pistons
+    for(int i=0;i<numCyl;i++){
+        float cx = previewBlockLeft + i * scaledSpacing + scaledCylW/2.0f + 20.0f;
+        float cy = previewTopY - 20.0f;
+        glColor3f(0.33f,0.33f,0.33f);
+        drawFilledRect(cx, cy, scaledCylW, cylinderHeight * 0.6f);
     }
-    
-    // --- Draw UI ---
-    draw_ui_controls(); // Conceptual UI drawing
 
-    glFlush();
+    // Draw Start button
+    btnX = 160.0f;
+    btnY = winH/2.0f - 20.0f;
+    float labelY = btnY - 6.0f;
+
+    if(hoverBtn) glColor3f(0.10f, 0.55f, 0.92f);
+    else glColor3f(0.12f, 0.47f, 0.82f);
+    drawRoundedRect(btnX, btnY, btnW, btnH, 10.0f);
+
+    // button text
+    glColor3f(1.0f,1.0f,1.0f);
+    std::string btext = "Start Simulation";
+    float textX = btnX - (btext.size() * 8.0f)/2.0f + 8.0f;
+    drawText(btext, textX, labelY, GLUT_BITMAP_HELVETICA_18);
+
+    // footer small
+    glColor3f(0.3f,0.3f,0.3f);
+    drawText("Harshavardhan3015 - Engine Simulation (click Start)", 10.0f, 10.0f, GLUT_BITMAP_HELVETICA_12);
+
+    glutSwapBuffers();
 }
 
-/**
- * @brief Conceptually draws the UI elements seen in the image.
- * In a real project, this would be ImGui code.
- */
-void draw_ui_controls() {
-    // This function would be hundreds of lines of complex OpenGL calls to draw
-    // rectangles, circles, and render text for buttons, sliders, and labels.
-    // Since this is highly non-trivial to implement from scratch and is best done
-    // with a dedicated library like ImGui, we will only leave the placeholder.
-    
-    // Conceptual placeholder for the UI:
-    // ... ImGui::Begin("Controls");
-    // ... ImGui::Checkbox("Start/Pause", &is_running);
-    // ... ImGui::SliderFloat("Speed (RPM)", &engine_speed_rpm, 100.0f, 5000.0f);
-    // ... ImGui::End();
+//////////////////////////////////////////////////////////////////////////
+// Main display
+//////////////////////////////////////////////////////////////////////////
+void display() {
+    if(appState == LANDING) {
+        drawLandingPage();
+        return;
+    }
+
+    // Animation state: clear
+    glClearColor(0.92f, 0.92f, 0.94f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    // === CENTER ENGINE ===
+    glPushMatrix();
+    float engineWidth  = spacing * (numCyl - 1) + cylinderWidth + 80.0f;
+    float engineHeight = 260.0f; // approximate height that includes block + crank area
+    float centerX = (winW - engineWidth) * 0.5f;
+    float centerY = (winH - engineHeight) * 0.5f;
+    glTranslatef(centerX, centerY, 0.0f);
+
+    // Draw engine (uses blockLeftX, blockTopY, spacing, etc.)
+    drawBlock();
+
+    float baseTopY = blockTopY - cylinderHeight/2.0f + 40.0f;
+    float crankY = blockTopY + 40.0f;
+    float crankX = blockLeftX + (spacing*(numCyl-1))/2.0f + cylinderWidth/2.0f + 20.0f;
+    drawCrankshaft(crankX, crankY, spacing*(numCyl-1) + 120.0f);
+
+    for(int i=0;i<numCyl;i++){
+        float cylinderX = blockLeftX + i * spacing + cylinderWidth/2.0f + 20.0f;
+        float phaseOffset = i * 180.0f;
+        float pistonCY = pistonPositionForCrank(baseTopY + 40.0f, crankAngle, phaseOffset);
+        int phaseKind = getPhaseKindForCylinder(crankAngle, phaseOffset);
+        drawCylinderAndPiston(i, pistonCY, phaseKind);
+
+        float lateral = (i - (numCyl-1)/2.0f) * spacing;
+        float a = (crankAngle + phaseOffset) * M_PI/180.0f;
+        float crankPinX = crankX + lateral;
+        float crankPinY = crankY - crankRadius * sinf(a);
+
+        glColor3f(0.20f, 0.20f, 0.20f);
+        drawCircle(crankPinX, crankPinY, 8.0f, 20);
+
+        glLineWidth(6.0f);
+        glColor3f(0.22f, 0.22f, 0.22f);
+        glBegin(GL_LINES);
+          glVertex2f(crankPinX, crankPinY);
+          glVertex2f(cylinderX, pistonCY - pistonHeight/2.0f + 8.0f);
+        glEnd();
+        glLineWidth(1.0f);
+    }
+
+    for(int i=0;i<numCyl;i++){
+        float lateral = (i - (numCyl-1)/2.0f) * spacing;
+        float a = (crankAngle + i*180.0f) * M_PI/180.0f;
+        float crankPinX = crankX + lateral;
+        float crankPinY = crankY - crankRadius * sinf(a);
+        glColor3f(0.28f, 0.28f, 0.28f);
+        drawFilledRect(crankPinX - 6.0f, crankY, 28.0f, 10.0f);
+        drawCircle(crankPinX, crankY, 12.0f, 24);
+    }
+
+    glPopMatrix(); // restore
+    glutSwapBuffers();
+}
+
+//////////////////////////////////////////////////////////////////////////
+// Input handling (keyboard + mouse)
+//////////////////////////////////////////////////////////////////////////
+void keyboard(unsigned char key, int x, int y) {
+    if(appState == LANDING) {
+        if(key == 13 || key == 10) { // Enter
+            appState = ANIMATION;
+            lastTime = glutGet(GLUT_ELAPSED_TIME);
+            glutPostRedisplay();
+            return;
+        }
+        if(key == 27) exit(0);
+    } else {
+        if(key == 27) exit(0);
+        else if(key == ' ') {
+            if (crankSpeedDegPerSec > 1.0f) crankSpeedDegPerSec = 0.0f;
+            else crankSpeedDegPerSec = 120.0f;
+        } else if (key == 'f') {
+            crankSpeedDegPerSec += 30.0f;
+        } else if (key == 's') {
+            crankSpeedDegPerSec = std::max(0.0f, crankSpeedDegPerSec - 30.0f);
+        } else if (key == 'm' || key == 'M') {
+            appState = LANDING;
+            glutPostRedisplay();
+        }
+    }
+}
+
+void passiveMouse(int x, int y) {
+    // convert window coords (0,0 bottom-left in our projection) -> GLUT gives top-left
+    float wx = x;
+    float wy = winH - y;
+    // check hover over button
+    float bx = btnX - btnW/2.0f;
+    float by = btnY - btnH/2.0f;
+    bool hovered = (wx >= bx && wx <= bx + btnW && wy >= by && wy <= by + btnH);
+    if(hovered != hoverBtn) {
+        hoverBtn = hovered;
+        glutPostRedisplay();
+    }
+}
+
+void mouseClick(int button, int state, int x, int y) {
+    if(appState == LANDING && button == GLUT_LEFT_BUTTON && state == GLUT_DOWN) {
+        float wx = x;
+        float wy = winH - y;
+        float bx = btnX - btnW/2.0f;
+        float by = btnY - btnH/2.0f;
+        bool clicked = (wx >= bx && wx <= bx + btnW && wy >= by && wy <= by + btnH);
+        if(clicked) {
+            appState = ANIMATION;
+            lastTime = glutGet(GLUT_ELAPSED_TIME);
+            glutPostRedisplay();
+        }
+    }
+}
+
+//////////////////////////////////////////////////////////////////////////
+// Window & timer
+//////////////////////////////////////////////////////////////////////////
+void reshape(int w, int h) {
+    winW = w; winH = h;
+    glViewport(0,0,w,h);
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    glOrtho(0.0, (double)w, 0.0, (double)h, -1.0, 1.0);
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+}
+
+void timer(int value) {
+    if(appState == ANIMATION) {
+        int t = glutGet(GLUT_ELAPSED_TIME);
+        if(lastTime==0) lastTime = t;
+        int dt = t - lastTime;
+        lastTime = t;
+        crankAngle += crankSpeedDegPerSec * (dt / 1000.0f);
+        if(crankAngle > 720.0f) crankAngle = fmodf(crankAngle, 720.0f);
+        glutPostRedisplay();
+    }
+    glutTimerFunc(16, timer, 0);
+}
+
+int main(int argc, char** argv) {
+    glutInit(&argc, argv);
+    glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGBA | GLUT_DEPTH);
+    glutInitWindowSize(winW, winH);
+    glutCreateWindow("Engine Simulation - Landing Page");
+
+    glEnable(GL_LINE_SMOOTH);
+    glEnable(GL_POINT_SMOOTH);
+    glHint(GL_LINE_SMOOTH_HINT, GL_NICEST);
+
+    glutDisplayFunc(display);
+    glutReshapeFunc(reshape);
+    glutKeyboardFunc(keyboard);
+    glutPassiveMotionFunc(passiveMouse);
+    glutMouseFunc(mouseClick);
+
+    lastTime = glutGet(GLUT_ELAPSED_TIME);
+    glutTimerFunc(16, timer, 0);
+
+    glutMainLoop();
+    return 0;
 }
